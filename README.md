@@ -1,3 +1,4 @@
+
 # Gel Photometric Forensics
 
 A CPU-based classical image processing framework for detecting localized photometric manipulation in scientific gel and western blot images.
@@ -29,4 +30,5 @@ datasets/ (not tracked)
 
 ## Status
 
-🚧 Under active development.
+Under active development.
+
