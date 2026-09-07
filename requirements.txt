@@ -1,0 +1,7 @@
+# LGPC-BC v1.1 detector dependencies.
+# CPU-only. No deep learning frameworks, no pretrained models.
+
+numpy>=1.23
+opencv-python>=4.6
+scipy>=1.9
+matplotlib>=3.6
