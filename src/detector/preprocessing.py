@@ -69,18 +69,26 @@ def load_grayscale_image(path: str) -> LoadedImage:
         raise InputValidationError(f"Failed to decode image: {path}")
 
     if raw.ndim == 3:
-        # Could be a color image, or a grayscale image saved with a
-        # redundant channel dimension of size 1.
+        # Could be a color image, a grayscale image saved with a redundant
+        # channel dimension of size 1, or grayscale data stored redundantly
+        # as RGB (R == G == B at every pixel — seen in the BioFors data).
         if raw.shape[2] == 1:
+            raw = raw[:, :, 0]
+        elif raw.dtype == np.uint8 and raw.shape[2] == 3 and np.array_equal(raw[:, :, 0], raw[:, :, 1]) and np.array_equal(raw[:, :, 1], raw[:, :, 2]):
+            # Genuinely single-channel data with no color information;
+            # take one channel verbatim. This is NOT an RGB->gray
+            # conversion (no averaging/weighting/blending of channels,
+            # no pixel values altered) — R, G, and B are already
+            # identical, so channel 0 IS the grayscale image.
             raw = raw[:, :, 0]
         else:
             raise InputValidationError(
-                f"'{path}' has {raw.shape[2]} channels. LGPC-BC v1.1 is defined "
-                "only for single-channel 8-bit grayscale images; color/"
-                "fluorescent images are explicitly out of scope. Convert "
-                "the image to single-channel grayscale yourself before "
-                "running the detector — this tool will not guess a "
-                "channel-merge for you."
+                f"'{path}' has {raw.shape[2]} channels with differing channel "
+                "content. LGPC-BC v1.1 is defined only for single-channel "
+                "8-bit grayscale images; color/fluorescent images are "
+                "explicitly out of scope. Convert the image to single-"
+                "channel grayscale yourself before running the detector — "
+                "this tool will not guess a channel-merge for you."
             )
 
     if raw.dtype != np.uint8:

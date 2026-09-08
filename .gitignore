@@ -24,6 +24,7 @@ datasets/
 # Outputs
 outputs/
 results/
+benchmark_runs/
 *.png
 *.jpg
 *.jpeg
