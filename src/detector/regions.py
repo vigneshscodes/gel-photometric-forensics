@@ -17,52 +17,82 @@ import cv2
 
 @dataclass
 class Block:
-    """One B x B (or smaller, at image edges — see note below) block."""
+    """One B x B (or smaller at image edges) block."""
 
     index: int
     row0: int
     col0: int
-    row1: int  # exclusive
-    col1: int  # exclusive
+    row1: int
+    col1: int
     n_flat_pixels: int
     eligible: bool
 
 
-# IMPLEMENTATION DECISION (documented ambiguity #3)
-# ---------------------------------------------------
-# The methodology says "partition into non-overlapping B x B blocks" but
-# does not say what to do when H or W is not an exact multiple of B.
-# Two options: (a) crop the image to a multiple of B, discarding a strip
-# of pixels, or (b) keep partial blocks at the bottom/right edge.
-#
-# (a) silently discards real image content and would shrink saturation/
-# gradient statistics computed elsewhere in a way the methodology never
-# asks for. (b) keeps every pixel but means a small number of blocks are
-# smaller than B x B (hence contain fewer possible flat pixels).
-#
-# Decision taken: (b), partial edge blocks are kept. Since eligibility
-# already depends only on the *count* of flat pixels (n_min), a smaller
-# edge block is simply less likely to reach n_min — it is not silently
-# treated as equivalent to a full block, and the diagnostics report block
-# sizes are not otherwise adjusted for this. This does not add any new
-# region-selection rule; eligibility is still governed solely by n_min.
 def compute_gradient_magnitude(image: np.ndarray) -> np.ndarray:
     """
     G(u, v): gradient magnitude of I via a standard first-derivative
-    operator, computed from I (not R) per methodology Section 5, to avoid
-    amplifying the background filter's own edge artifacts.
+    operator, computed from I (not R) per methodology Section 5.
 
-    IMPLEMENTATION DECISION (documented ambiguity #4): the methodology
-    says "a standard first-derivative operator" without naming one. We use
-    a 3x3 Sobel operator (the most common default choice for gradient-
-    magnitude flat/edge gating in image forensics), applied to the image
-    as float64. This is a fixed, disclosed choice, not a tunable knob.
+    Uses a 3x3 Sobel operator.
     """
     image_f = image.astype(np.float64)
-    gx = cv2.Sobel(image_f, cv2.CV_64F, 1, 0, ksize=3)
-    gy = cv2.Sobel(image_f, cv2.CV_64F, 0, 1, ksize=3)
+
+    gx = cv2.Sobel(
+        image_f,
+        cv2.CV_64F,
+        1,
+        0,
+        ksize=3,
+    )
+
+    gy = cv2.Sobel(
+        image_f,
+        cv2.CV_64F,
+        0,
+        1,
+        ksize=3,
+    )
+
     G = np.sqrt(gx ** 2 + gy ** 2)
+
     return G
+
+
+def compute_adaptive_grad_threshold(
+    gradient_magnitude: np.ndarray,
+    saturation_mask: np.ndarray,
+    percentile: float,
+) -> float:
+    """
+    Compute an image-adaptive gradient threshold from the observed
+    non-saturated gradient-magnitude distribution.
+
+    The threshold is the requested percentile of gradient magnitudes
+    over non-saturated pixels.
+
+    Flat(u, v) remains:
+        G(u, v) < theta_grad and Sat(u, v) == 0
+
+    Eligibility remains governed solely by:
+        |F_k| >= n_min
+    """
+    if gradient_magnitude.shape != saturation_mask.shape:
+        raise ValueError(
+            "gradient_magnitude and saturation_mask must have the same shape."
+        )
+
+    if not (0.0 < percentile < 100.0):
+        raise ValueError("percentile must be in (0, 100).")
+
+    non_saturated = gradient_magnitude[~saturation_mask]
+
+    if non_saturated.size == 0:
+        raise ValueError(
+            "Cannot derive an adaptive gradient threshold: every pixel is "
+            "saturated (no non-saturated pixels to estimate a threshold from)."
+        )
+
+    return float(np.percentile(non_saturated, percentile))
 
 
 def compute_flat_mask(
@@ -71,26 +101,41 @@ def compute_flat_mask(
     theta_grad: float,
 ) -> np.ndarray:
     """
-    Flat(u, v) = 1 if G(u, v) < theta_grad and Sat(u, v) == 0, else 0.
+    Flat(u, v) = 1 if G(u, v) < theta_grad and Sat(u, v) == 0.
     """
     if gradient_magnitude.shape != saturation_mask.shape:
-        raise ValueError("gradient_magnitude and saturation_mask must have the same shape.")
-    flat = (gradient_magnitude < theta_grad) & (~saturation_mask)
+        raise ValueError(
+            "gradient_magnitude and saturation_mask must have the same shape."
+        )
+
+    flat = (
+        (gradient_magnitude < theta_grad)
+        & (~saturation_mask)
+    )
+
     return flat.astype(bool)
 
 
-def partition_blocks(height: int, width: int, block_size: int) -> List[Block]:
+def partition_blocks(
+    height: int,
+    width: int,
+    block_size: int,
+) -> List[Block]:
     """
     Partition an H x W image into non-overlapping B x B blocks in
-    row-major order, keeping partial blocks at the bottom/right edge
-    (see documented ambiguity #3 above). Eligibility is not decided here.
+    row-major order, keeping partial blocks at the bottom/right edge.
+
+    Eligibility is not decided here.
     """
     blocks: List[Block] = []
     idx = 0
+
     for row0 in range(0, height, block_size):
         row1 = min(row0 + block_size, height)
+
         for col0 in range(0, width, block_size):
             col1 = min(col0 + block_size, width)
+
             blocks.append(
                 Block(
                     index=idx,
@@ -102,19 +147,30 @@ def partition_blocks(height: int, width: int, block_size: int) -> List[Block]:
                     eligible=False,
                 )
             )
+
             idx += 1
+
     return blocks
 
 
-def mark_eligibility(blocks: List[Block], flat_mask: np.ndarray, n_min: int) -> None:
+def mark_eligibility(
+    blocks: List[Block],
+    flat_mask: np.ndarray,
+    n_min: int,
+) -> None:
     """
-    Sets n_flat_pixels and eligible=True/False on each Block in place.
+    Sets n_flat_pixels and eligible=True/False on each Block.
 
-    Eligibility rule (the ONLY region-selection rule per Section 7):
+    Eligibility rule (the ONLY region-selection rule):
         eligible iff |F_k| >= n_min
     """
     for b in blocks:
-        sub_flat = flat_mask[b.row0 : b.row1, b.col0 : b.col1]
+        sub_flat = flat_mask[
+            b.row0:b.row1,
+            b.col0:b.col1,
+        ]
+
         n_flat = int(np.count_nonzero(sub_flat))
+
         b.n_flat_pixels = n_flat
         b.eligible = n_flat >= n_min
