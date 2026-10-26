@@ -54,6 +54,7 @@ from .consistency import (
     compute_residuals_and_zscores,
     compute_image_level_score,
     decide,
+    estimate_residual_scale,
 )
 
 from .visualization import (
@@ -111,7 +112,7 @@ def run_on_image(
     )
 
     # --- Section 5: gradient magnitude, flat mask, blocks, eligibility ---
-    G = compute_gradient_magnitude(image)
+    G = compute_gradient_magnitude(image, config.grad_smooth_sigma)
 
     # theta_grad: manual override if set, otherwise derived from this
     # image's own non-saturated gradient-magnitude distribution.
@@ -170,11 +171,13 @@ def run_on_image(
         image,
         R,
         flat_mask,
+        config.dispersion_estimator,
     )
 
     curve = fit_dispersion_curve(
         block_stats,
         config.n_bins,
+        config.bin_mode,
     )
 
     # --- Section 6: residual + robust z-score ---
@@ -200,6 +203,8 @@ def run_on_image(
         if valid_r.size > 0
         else float("nan")
     )
+
+    residual_scale, residual_scale_source = estimate_residual_scale(valid_r)
 
     # --- Sections 9-10: image-level score + decision ---
     m_image = compute_image_level_score(
@@ -328,6 +333,9 @@ def run_on_image(
         "dispersion_curve_populated_bin_medians":
             curve.interp_y.tolist(),
 
+        "residual_scale_used": residual_scale,
+        "residual_scale_source": residual_scale_source,
+
         "residual_r_mad_goodness_of_fit":
             residual_mad_diag,
 
@@ -364,7 +372,7 @@ def run_on_image(
             "Does not detect matched-noise-evasion manipulation.",
             "Does not detect edits smaller than one block (B x B).",
             "Not validated on composite/multi-acquisition images (out of scope).",
-            "Not empirically validated at all yet; no benchmark has been run.",
+            "Calibrated only on synthetic data; see README for actual benchmark metrics.",
         ],
     }
 

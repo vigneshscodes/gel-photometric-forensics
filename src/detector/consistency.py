@@ -28,6 +28,46 @@ from .statistics import (
 
 
 MAD_TO_SIGMA_CONSTANT = 1.4826
+IQR_TO_SIGMA_CONSTANT = 1.3490
+
+# Lower bound on the residual scale (log-dispersion units). The log of a
+# MAD estimated from ~100 integer-valued pixels has a sampling sd of
+# roughly 0.1; a scale far below that is a quantization artefact, not
+# evidence of a tight fit, and would turn noise into huge z-scores.
+MIN_RESIDUAL_SCALE = 0.05
+
+
+def estimate_residual_scale(valid_r: np.ndarray):
+    """
+    Robust scale of the residuals r_k, with an explicit fallback ladder
+    instead of silently returning NaN (the original v1.1 behaviour when
+    MAD(r) == 0, which happens routinely because block MADs of 8-bit data
+    are quantized and many blocks share identical s_k).
+
+    Ladder: 1.4826*MAD -> IQR/1.349 -> std -> undefined.
+    A floor of MIN_RESIDUAL_SCALE is applied to any positive estimate.
+    Returns (scale_or_nan, source_string).
+    """
+    valid_r = np.asarray(valid_r, dtype=np.float64)
+    valid_r = valid_r[np.isfinite(valid_r)]
+    if valid_r.size == 0:
+        return float("nan"), "no_valid_residuals"
+    if np.all(valid_r == 0.0):
+        return 0.0, "all_residuals_zero"
+
+    mad = median_absolute_deviation(valid_r)
+    if np.isfinite(mad) and mad > 0.0:
+        return max(MAD_TO_SIGMA_CONSTANT * mad, MIN_RESIDUAL_SCALE), "mad"
+
+    q75, q25 = np.percentile(valid_r, [75, 25])
+    if q75 - q25 > 0.0:
+        return max((q75 - q25) / IQR_TO_SIGMA_CONSTANT, MIN_RESIDUAL_SCALE), "iqr_fallback"
+
+    sd = float(np.std(valid_r))
+    if sd > 0.0:
+        return max(sd, MIN_RESIDUAL_SCALE), "std_fallback"
+
+    return float("nan"), "undefined"
 
 
 @dataclass
@@ -96,18 +136,13 @@ def compute_residuals_and_zscores(
     z_arr = np.full(mu_arr.shape, np.nan, dtype=np.float64)
 
     if valid_r.size:
-        residual_mad = median_absolute_deviation(valid_r)
+        scale, _source = estimate_residual_scale(valid_r)
 
-        if np.isfinite(residual_mad) and residual_mad > 0.0:
-            denom = MAD_TO_SIGMA_CONSTANT * residual_mad
-            z_arr[valid] = r_arr[valid] / denom
-
-        elif np.all(valid_r == 0.0):
+        if scale == 0.0:
             # All valid residuals match the fitted curve exactly.
             z_arr[valid] = 0.0
-
-        # Otherwise MAD is zero but at least one residual is nonzero.
-        # Leave z-scores undefined: no arbitrary fallback scale.
+        elif np.isfinite(scale):
+            z_arr[valid] = r_arr[valid] / scale
 
     # Map calculations back to the original block order.
     eligible_iter = iter(zip(s_hat_arr, r_arr, z_arr))

@@ -112,7 +112,9 @@ def _save_case(
     return {"image_path": image_path, "mask_path": mask_path, "label_path": label_path}
 
 
-def build_sanity_case_list(output_dir: str, base_seed: int = 1000) -> List[CaseRecord]:
+def build_sanity_case_list(
+    output_dir: str, base_seed: int = 1000, n_bases: int = 2, n_local_bases: int = 1
+) -> List[CaseRecord]:
     """
     Builds and WRITES a small (~40-case) sanity benchmark:
       - 2 base images (different seeds) x clean                     = 2
@@ -122,7 +124,7 @@ def build_sanity_case_list(output_dir: str, base_seed: int = 1000) -> List[CaseR
     """
     records: List[CaseRecord] = []
 
-    base_seeds = [base_seed, base_seed + 1]
+    base_seeds = [base_seed + i for i in range(n_bases)]
     bases = {s: generate_base_image(seed=s) for s in base_seeds}
 
     # --- 1. clean ---
@@ -244,80 +246,80 @@ def build_sanity_case_list(output_dir: str, base_seed: int = 1000) -> List[CaseR
     region_rng = np.random.default_rng(base_seed + 999)  # controls region placement search only
 
     for category, (transform_kind, raw_params) in local_specs.items():
-        s = base_seeds[0]  # one base image per local family keeps the sanity set small
-        base = bases[s]
-        for size_name, (box_h, box_w) in LOCAL_SIZES.items():
-            for placement in LOCAL_PLACEMENTS:
-                params = dict(raw_params)
-                if transform_kind == "nonlinear_tone":
-                    lut_rng = np.random.default_rng(params.pop("lut_seed"))
-                    params["lut"] = make_random_monotonic_lut(lut_rng)
+        for s in base_seeds[:n_local_bases]:  # default: one base per local family (small sanity set)
+          base = bases[s]
+          for size_name, (box_h, box_w) in LOCAL_SIZES.items():
+              for placement in LOCAL_PLACEMENTS:
+                  params = dict(raw_params)
+                  if transform_kind == "nonlinear_tone":
+                      lut_rng = np.random.default_rng(params.pop("lut_seed"))
+                      params["lut"] = make_random_monotonic_lut(lut_rng)
 
-                r0, c0 = find_region_for_placement(
-                    base.band_mask, box_h, box_w, placement, region_rng
-                )
-                region_mask = make_region_mask(base.height, base.width, r0, c0, box_h, box_w)
-                edited = apply_local_transform(base.image, transform_kind, params, region_mask)
+                  r0, c0 = find_region_for_placement(
+                      base.band_mask, box_h, box_w, placement, region_rng
+                  )
+                  region_mask = make_region_mask(base.height, base.width, r0, c0, box_h, box_w)
+                  edited = apply_local_transform(base.image, transform_kind, params, region_mask)
 
-                subtype = f"{size_name}_{placement}"
-                case_id = f"{category}_seed{s}_{subtype}"
+                  subtype = f"{size_name}_{placement}"
+                  case_id = f"{category}_seed{s}_{subtype}"
 
-                is_below_block = (box_h < 16) or (box_w < 16)
-                if placement == "band_interior":
-                    expected = (
-                        "expect_undetectable (band-interior edit; ineligible by "
-                        "construction, methodology Section 14/17)"
-                    )
-                elif is_below_block:
-                    expected = (
-                        "expect_likely_undetectable (region smaller than block size "
-                        "B=16; diluted within the block's flat-pixel population, "
-                        "methodology Section 14) — not guaranteed either way"
-                    )
-                else:
-                    expected = (
-                        "expect_possibly_detectable (background or crossing "
-                        "placement, region >= block size) — not guaranteed; no "
-                        "threshold has been calibrated yet"
-                    )
+                  is_below_block = (box_h < 16) or (box_w < 16)
+                  if placement == "band_interior":
+                      expected = (
+                          "expect_undetectable (band-interior edit; ineligible by "
+                          "construction, methodology Section 14/17)"
+                      )
+                  elif is_below_block:
+                      expected = (
+                          "expect_likely_undetectable (region smaller than block size "
+                          "B=16; diluted within the block's flat-pixel population, "
+                          "methodology Section 14) — not guaranteed either way"
+                      )
+                  else:
+                      expected = (
+                          "expect_possibly_detectable (background or crossing "
+                          "placement, region >= block size) — not guaranteed; no "
+                          "threshold has been calibrated yet"
+                      )
 
-                label = {
-                    "case_id": case_id,
-                    "category": category,
-                    "subtype": subtype,
-                    "is_local": True,
-                    "image_level_label": "local_manipulated",
-                    "expected_behavior": expected,
-                    "base_seed": s,
-                    "base_image_params": base.params,
-                    "transform_kind": transform_kind,
-                    "transform_params": {k: v for k, v in params.items() if k != "lut"},
-                    "lut_present": "lut" in params,
-                    "region": {
-                        "row0": r0,
-                        "col0": c0,
-                        "height": box_h,
-                        "width": box_w,
-                        "placement": placement,
-                        "smaller_than_block_size_16": is_below_block,
-                    },
-                }
-                paths = _save_case(output_dir, case_id, edited, region_mask, label)
-                records.append(
-                    CaseRecord(
-                        case_id=case_id,
-                        category=category,
-                        subtype=subtype,
-                        is_local=True,
-                        image_level_label="local_manipulated",
-                        expected_behavior=expected,
-                        base_seed=s,
-                        transform_kind=transform_kind,
-                        transform_params_summary=subtype,
-                        region=label["region"],
-                        **paths,
-                    )
-                )
+                  label = {
+                      "case_id": case_id,
+                      "category": category,
+                      "subtype": subtype,
+                      "is_local": True,
+                      "image_level_label": "local_manipulated",
+                      "expected_behavior": expected,
+                      "base_seed": s,
+                      "base_image_params": base.params,
+                      "transform_kind": transform_kind,
+                      "transform_params": {k: v for k, v in params.items() if k != "lut"},
+                      "lut_present": "lut" in params,
+                      "region": {
+                          "row0": r0,
+                          "col0": c0,
+                          "height": box_h,
+                          "width": box_w,
+                          "placement": placement,
+                          "smaller_than_block_size_16": is_below_block,
+                      },
+                  }
+                  paths = _save_case(output_dir, case_id, edited, region_mask, label)
+                  records.append(
+                      CaseRecord(
+                          case_id=case_id,
+                          category=category,
+                          subtype=subtype,
+                          is_local=True,
+                          image_level_label="local_manipulated",
+                          expected_behavior=expected,
+                          base_seed=s,
+                          transform_kind=transform_kind,
+                          transform_params_summary=subtype,
+                          region=label["region"],
+                          **paths,
+                      )
+                  )
 
     return records
 
@@ -364,7 +366,7 @@ def main() -> int:
     parser.add_argument("--seed", type=int, default=1000, help="Base RNG seed (default: 1000).")
     parser.add_argument(
         "--mode",
-        choices=["sanity"],
+        choices=["sanity", "calibration"],
         default="sanity",
         help="Only 'sanity' (small, ~40-case) generation is implemented right now.",
     )
@@ -374,6 +376,11 @@ def main() -> int:
 
     if args.mode == "sanity":
         records = build_sanity_case_list(args.output_dir, base_seed=args.seed)
+    elif args.mode == "calibration":
+        # Larger set on a DIFFERENT seed range, used only to choose tau.
+        records = build_sanity_case_list(
+            args.output_dir, base_seed=args.seed, n_bases=8, n_local_bases=4
+        )
     else:
         raise NotImplementedError("Only --mode sanity is implemented; the full benchmark is a later step.")
 

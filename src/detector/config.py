@@ -44,9 +44,17 @@ class LGPCBCConfig:
     # grad_percentile.
     grad_threshold: Optional[float] = None
 
+    # Gaussian pre-smoothing (sigma, pixels) applied before the Sobel
+    # gradient used ONLY for flat-region gating. Without it, white noise
+    # dominates the gradient, so a locally amplified-noise region (the
+    # signature of a local contrast/gamma edit) is classed "non-flat",
+    # becomes ineligible, and is therefore never scored. 0 = legacy
+    # unsmoothed behaviour.
+    grad_smooth_sigma: float = 0.7
+
     # Percentile used to derive the gradient threshold when
     # grad_threshold is None.
-    grad_percentile: float = 40.0
+    grad_percentile: float = 60.0
 
     # --- Block eligibility ---
     min_flat_pixels: int = 96
@@ -59,7 +67,20 @@ class LGPCBCConfig:
     #
     # Reduced from 16 to 8 because the synthetic images often occupy
     # a limited intensity range.
-    n_bins: int = 8
+    n_bins: int = 12
+
+    # 'quantile': bin edges are quantiles of the eligible blocks' mu_k, so
+    #             every bin is populated and the curve spans the range the
+    #             image actually occupies (fixes sparse fixed [0,255] bins).
+    # 'range'   : legacy equal-width bins over [0, 255].
+    bin_mode: str = "quantile"
+
+    # Per-block dispersion estimator s_k:
+    # 'trimmed_std': std of residuals after discarding the 10% largest
+    #                |R - median|. Far less quantized than a raw MAD of
+    #                8-bit data (a MAD only takes values 0.5, 1.0, 1.5...).
+    # 'mad'        : legacy raw MAD of R.
+    dispersion_estimator: str = "trimmed_std"
 
     # --- Numerical stabilizer ---
     epsilon_0: float = 1.0e-6
@@ -68,11 +89,12 @@ class LGPCBCConfig:
     #
     # PROVISIONAL ONLY.
     # Must be calibrated using the synthetic benchmark.
-    beta: float = 95.0
+    beta: float = 100.0
 
-    # PROVISIONAL ONLY.
-    # Must be calibrated against the desired false-positive rate.
-    tau: float = 3.5
+    # Calibrated on synthetic calibration seeds 5000-5007 (negatives only)
+    # for a 10% target FPR via src/evaluation/calibrate_tau.py.
+    # Synthetic-only calibration: re-calibrate for any other image source.
+    tau: float = 7.55
 
     def validate(self) -> None:
         """Basic structural sanity checks (not scientific calibration)."""
@@ -103,6 +125,9 @@ class LGPCBCConfig:
                 "grad_threshold must be non-negative."
             )
 
+        if self.grad_smooth_sigma < 0:
+            raise ValueError("grad_smooth_sigma must be non-negative.")
+
         if not (0.0 < self.grad_percentile < 100.0):
             raise ValueError(
                 "grad_percentile must be in (0, 100)."
@@ -122,6 +147,12 @@ class LGPCBCConfig:
             raise ValueError(
                 "n_bins (N_bin) must be positive."
             )
+
+        if self.bin_mode not in ("quantile", "range"):
+            raise ValueError("bin_mode must be 'quantile' or 'range'.")
+
+        if self.dispersion_estimator not in ("trimmed_std", "mad"):
+            raise ValueError("dispersion_estimator must be 'trimmed_std' or 'mad'.")
 
         if self.epsilon_0 <= 0:
             raise ValueError(

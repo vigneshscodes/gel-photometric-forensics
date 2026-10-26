@@ -48,6 +48,10 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--c-lo", type=int, help="Lower saturation bound.")
     parser.add_argument("--c-hi", type=int, help="Upper saturation bound.")
     parser.add_argument("--n-bins", type=int, help="N_bin: number of intensity bins for the dispersion curve.")
+    parser.add_argument("--grad-smooth-sigma", type=float, help="Gaussian sigma applied before the gating gradient (0 = legacy).")
+    parser.add_argument("--grad-percentile", type=float, help="Percentile for the adaptive flat-region gradient threshold.")
+    parser.add_argument("--dispersion-estimator", choices=["trimmed_std", "mad"], help="Per-block dispersion estimator.")
+    parser.add_argument("--bin-mode", choices=["quantile", "range"], help="Dispersion-curve binning mode.")
     parser.add_argument("--epsilon", type=float, help="epsilon_0: log-stabilizing constant.")
     parser.add_argument("--beta", type=float, help="Percentile (0-100) used to aggregate block z-scores into M_image.")
     parser.add_argument("--tau", type=float, help="Decision threshold on M_image. UNCALIBRATED placeholder if left default.")
@@ -71,6 +75,14 @@ def config_from_args(args: argparse.Namespace) -> LGPCBCConfig:
         cfg.c_hi = args.c_hi
     if args.n_bins is not None:
         cfg.n_bins = args.n_bins
+    if args.grad_smooth_sigma is not None:
+        cfg.grad_smooth_sigma = args.grad_smooth_sigma
+    if args.grad_percentile is not None:
+        cfg.grad_percentile = args.grad_percentile
+    if args.dispersion_estimator is not None:
+        cfg.dispersion_estimator = args.dispersion_estimator
+    if args.bin_mode is not None:
+        cfg.bin_mode = args.bin_mode
     if args.epsilon is not None:
         cfg.epsilon_0 = args.epsilon
     if args.beta is not None:
@@ -97,8 +109,8 @@ def main() -> int:
         return 2
 
     print("=" * 70)
-    print("LGPC-BC v1.1 — active parameters (ALL are provisional/uncalibrated;")
-    print("see src/detector/config.py docstring before trusting any result):")
+    print("LGPC-BC v1.1 — active parameters (synthetic-calibrated only;")
+    print("see README.md limitations before trusting any result):")
     for k, v in config.as_dict().items():
         print(f"    {k:16s} = {v}")
     print("=" * 70)

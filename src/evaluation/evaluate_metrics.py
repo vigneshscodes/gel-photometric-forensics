@@ -133,6 +133,21 @@ def calculate_classification_metrics(
     }
 
 
+def calculate_auc(y_true: list[int], scores: list[float]) -> Optional[float]:
+    """Rank-based ROC AUC (ties = 0.5). None if one class is absent."""
+    pos = [s for t, s in zip(y_true, scores) if t == 1]
+    neg = [s for t, s in zip(y_true, scores) if t == 0]
+    if not pos or not neg:
+        return None
+    wins = sum((p > n) + 0.5 * (p == n) for p in pos for n in neg)
+    return wins / (len(pos) * len(neg))
+
+
+def calculate_mcc(tp: int, tn: int, fp: int, fn: int) -> float:
+    denom = math.sqrt((tp + fp) * (tp + fn) * (tn + fp) * (tn + fn))
+    return (tp * tn - fp * fn) / denom if denom else 0.0
+
+
 def calculate_iou(
     ground_truth: np.ndarray,
     prediction: np.ndarray,
@@ -233,7 +248,7 @@ def main() -> int:
     parser.add_argument(
         "--localization-threshold",
         type=float,
-        default=3.5,
+        default=None,
         help=(
             "Threshold applied to absolute raw consistency-map values "
             "for localization IoU. Default: 3.5; not automatically calibrated."
@@ -241,8 +256,9 @@ def main() -> int:
     )
     args = parser.parse_args()
 
-    if not math.isfinite(args.localization_threshold) or (
-        args.localization_threshold < 0
+    if args.localization_threshold is not None and (
+        not math.isfinite(args.localization_threshold)
+        or args.localization_threshold < 0
     ):
         parser.error("--localization-threshold must be finite and non-negative.")
 
@@ -262,6 +278,11 @@ def main() -> int:
         for row in manifest_rows
         if row.get("case_id")
     }
+
+    if args.localization_threshold is None:
+        taus = [parse_float(r.get("tau_used")) for r in result_rows]
+        taus = [t for t in taus if t is not None]
+        args.localization_threshold = taus[0] if taus else 3.5
 
     per_case: list[dict[str, Any]] = []
     y_true: list[int] = []
@@ -347,6 +368,42 @@ def main() -> int:
         per_case.append(case_result)
 
     classification = calculate_classification_metrics(y_true, y_pred)
+    classification["MCC"] = calculate_mcc(
+        classification["TP"], classification["TN"], classification["FP"], classification["FN"]
+    )
+    # AUC uses the raw M_image; undefined (NaN) scores count as 0, i.e.
+    # "no evidence", and their number is reported rather than hidden.
+    auc_t, auc_s, n_undef = [], [], 0
+    for c in per_case:
+        if c["image_ground_truth_positive"] is None:
+            continue
+        m = c["M_image"]
+        if m is None:
+            n_undef += 1
+            m = 0.0
+        auc_t.append(c["image_ground_truth_positive"])
+        auc_s.append(m)
+    classification["AUC_ROC"] = calculate_auc(auc_t, auc_s)
+    classification["n_undefined_M_image"] = n_undef
+
+    # Per-family detection rate (recall for local families, FPR for the rest)
+    # and the "in-scope" subset (band-interior edits are documented as
+    # undetectable by construction and are excluded here, not hidden above).
+    by_cat: dict[str, list[int]] = {}
+    in_scope_t, in_scope_p = [], []
+    sub_by_id = {r["case_id"]: r.get("subtype", "") for r in result_rows}
+    for c in per_case:
+        if c["image_prediction_positive"] is None:
+            continue
+        cat = next((r["category"] for r in result_rows if r["case_id"] == c["case_id"]), "?")
+        by_cat.setdefault(cat, []).append(c["image_prediction_positive"])
+        if "band_interior" not in sub_by_id.get(c["case_id"], ""):
+            in_scope_t.append(c["image_ground_truth_positive"])
+            in_scope_p.append(c["image_prediction_positive"])
+    classification["flag_rate_by_category"] = {
+        k: {"n": len(v), "flag_rate": sum(v) / len(v)} for k, v in sorted(by_cat.items())
+    }
+    classification["in_scope_excluding_band_interior"] = calculate_classification_metrics(in_scope_t, in_scope_p)
 
     localization_summary = {
         "n_localization_cases_with_iou": len(localization_ious),

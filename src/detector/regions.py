@@ -28,7 +28,7 @@ class Block:
     eligible: bool
 
 
-def compute_gradient_magnitude(image: np.ndarray) -> np.ndarray:
+def compute_gradient_magnitude(image: np.ndarray, smooth_sigma: float = 0.0) -> np.ndarray:
     """
     G(u, v): gradient magnitude of I via a standard first-derivative
     operator, computed from I (not R) per methodology Section 5.
@@ -36,6 +36,8 @@ def compute_gradient_magnitude(image: np.ndarray) -> np.ndarray:
     Uses a 3x3 Sobel operator.
     """
     image_f = image.astype(np.float64)
+    if smooth_sigma and smooth_sigma > 0:
+        image_f = cv2.GaussianBlur(image_f, (0, 0), smooth_sigma, borderType=cv2.BORDER_REFLECT)
 
     gx = cv2.Sobel(
         image_f,
