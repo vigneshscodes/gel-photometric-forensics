@@ -1,0 +1,9 @@
+{
+  "input_path": "D:\\project1\\Results\\clean_candidates\\1__020001.png",
+  "height": 52,
+  "width": 295,
+  "dtype": "uint8",
+  "channels": 1,
+  "validated_single_channel_8bit_grayscale": true,
+  "resized": false
+}

@@ -1,0 +1,9 @@
+{
+  "input_path": "C:\\Users\\vigne\\OneDrive\\Documents\\project1\\benchmark_runs\\repro\\test\\cases\\local_contrast_seed1000_small_8x8_crossing\\image.png",
+  "height": 256,
+  "width": 256,
+  "dtype": "uint8",
+  "channels": 1,
+  "validated_single_channel_8bit_grayscale": true,
+  "resized": false
+}
