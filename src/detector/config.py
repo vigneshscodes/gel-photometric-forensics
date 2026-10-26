@@ -91,10 +91,31 @@ class LGPCBCConfig:
     # Must be calibrated using the synthetic benchmark.
     beta: float = 100.0
 
-    # Calibrated on synthetic calibration seeds 5000-5007 (negatives only)
-    # for a 10% target FPR via src/evaluation/calibrate_tau.py.
+    # v1.2: re-calibrated for the FUSED block score (dispersion + level +
+    # histogram channels, pooled) on synthetic calibration seeds 5000-5007
+    # (clean + legitimate-global negatives only), 10% target FPR, via
+    # src/evaluation/calibrate_tau.py. (v1.1 dispersion-only value was 7.55.)
     # Synthetic-only calibration: re-calibrate for any other image source.
     tau: float = 7.55
+
+    # --- v1.2 complementary channels (local-global consistency) ---
+    # Fused block score = max over {dispersion, level, histogram} channels of
+    # max(|z_raw|, |z_pooled|). Set use_extra_channels=False for v1.1 behaviour.
+    use_extra_channels: bool = True
+    level_poly_degree: int = 2        # global background surface order
+    level_step_ratio: float = 0.15    # min edge-gradient/amplitude to credit a level shift
+    # Histogram-comb channel: implemented, but OFF by default. On the synthetic
+    # benchmark it fired on legitimate global tone edits as strongly as on local
+    # ones (no discriminative gain) and forced a higher tau. Enable for
+    # lossless (PNG/TIFF) data with large (>=64 px) suspected edits.
+    use_hist_channel: bool = False
+    hist_window: int = 32             # px window for histogram roughness
+    hist_min_pixels: int = 256
+    pool_size: int = 3                # signed block pooling (odd); 1 = off
+
+    # --- v1.2 mask localisation (hysteresis on the fused block map) ---
+    # Seeds: score >= tau. Growth: connected blocks with score >= loc_ratio*tau.
+    loc_ratio: float = 0.6
 
     def validate(self) -> None:
         """Basic structural sanity checks (not scientific calibration)."""
@@ -153,6 +174,15 @@ class LGPCBCConfig:
 
         if self.dispersion_estimator not in ("trimmed_std", "mad"):
             raise ValueError("dispersion_estimator must be 'trimmed_std' or 'mad'.")
+
+        if self.level_poly_degree not in (0, 1, 2, 3):
+            raise ValueError("level_poly_degree must be in 0..3.")
+        if self.pool_size < 1 or self.pool_size % 2 == 0:
+            raise ValueError("pool_size must be a positive odd integer.")
+        if not (0.0 < self.loc_ratio <= 1.0):
+            raise ValueError("loc_ratio must be in (0, 1].")
+        if self.hist_window < self.block_size:
+            raise ValueError("hist_window must be >= block_size.")
 
         if self.epsilon_0 <= 0:
             raise ValueError(

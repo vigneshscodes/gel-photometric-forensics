@@ -94,28 +94,63 @@ def build_eligibility_mask(
 
 
 def build_suspicious_region_mask(
-    height: int, width: int, blocks: List[Block], block_consistency: List[BlockConsistency], tau: float
+    height: int, width: int, blocks: List[Block], block_consistency: List[BlockConsistency], tau: float,
+    loc_ratio: float = 1.0,
+    loc_consistency: Optional[List[BlockConsistency]] = None,
 ) -> np.ndarray:
     """
-    uint8 mask: 255 for eligible blocks whose |z_k| >= tau, 0 elsewhere
-    (including ineligible blocks, which are neither "suspicious" nor
-    "clean" — they simply cannot be marked suspicious without a defined
-    score. This mask alone is NOT a substitute for checking the
-    eligibility mask.)
+    uint8 mask (255 = suspicious) from the fused block score map.
 
-    IMPLEMENTATION DECISION (documented ambiguity #8): the methodology
-    defines tau only for the single image-level decision M_image >= tau
-    (Section 10); it does not define a separate per-block localization
-    threshold. Reusing the same tau per-block is the smallest choice that
-    introduces no new scientific parameter — it is disclosed here, and
-    the diagnostics record that this mask is threshold-reused, not an
-    independently calibrated localization rule.
+    v1.1 reused the image-level tau (calibrated on the MAX over all blocks)
+    as a per-block cut, so only the single strongest blocks survived and
+    the mask lost regions plainly visible in the heatmap. v1.2 uses
+    hysteresis on the block grid:
+      seeds  : score >= tau            (image-level evidence; empty if unflagged)
+      region : blocks with score >= loc_ratio*tau connected (8-neighbour)
+               to a seed
+      repair : 3x3 closing + hole filling bridges ineligible / gated blocks
+               inside an edit (their score is undefined, not 'clean'), limited
+               to one block beyond the grown region.
+    Seeds use block_consistency (fused, pooled+raw: image-level evidence);
+    growth uses loc_consistency (UNPOOLED fused score) when given, because
+    pooling smears a high score onto neighbouring clean blocks and would
+    enlarge the mask beyond the edit.
+    loc_ratio=1.0 reproduces the legacy plain per-block cut.
+    Ineligible blocks never seed or grow a region on their own.
     """
-    mask = np.zeros((height, width), dtype=np.uint8)
+    from scipy import ndimage
+
+    nc = sum(1 for b in blocks if b.row0 == 0)
+    nr = len(blocks) // nc
+    grid = np.full((nr, nc), np.nan)
     by_index = {bc.block_index: bc for bc in block_consistency}
     for b in blocks:
         bc = by_index[b.index]
-        if bc.eligible and not np.isnan(bc.z_k) and abs(bc.z_k) >= tau:
+        if bc.eligible and not np.isnan(bc.z_k):
+            grid[b.row0 // (blocks[0].row1 - blocks[0].row0), b.col0 // (blocks[0].col1 - blocks[0].col0)] = abs(bc.z_k)
+
+    lgrid = grid
+    if loc_consistency is not None:
+        lgrid = np.full((nr, nc), np.nan)
+        lby = {bc.block_index: bc for bc in loc_consistency}
+        for b in blocks:
+            bc = lby[b.index]
+            if bc.eligible and not np.isnan(bc.z_k):
+                lgrid[b.row0 // (blocks[0].row1 - blocks[0].row0), b.col0 // (blocks[0].col1 - blocks[0].col0)] = abs(bc.z_k)
+
+    with np.errstate(invalid="ignore"):
+        seeds = grid >= tau
+        low = lgrid >= loc_ratio * tau
+    region = ndimage.binary_propagation(seeds, structure=np.ones((3, 3), bool), mask=low | seeds)
+    if loc_ratio < 1.0 and region.any():
+        closed = ndimage.binary_closing(np.pad(region, 1), structure=np.ones((3, 3), bool))[1:-1, 1:-1]
+        region = ndimage.binary_fill_holes(closed | region)
+
+    mask = np.zeros((height, width), dtype=np.uint8)
+    bh = blocks[0].row1 - blocks[0].row0
+    bw = blocks[0].col1 - blocks[0].col0
+    for b in blocks:
+        if region[b.row0 // bh, b.col0 // bw]:
             mask[b.row0 : b.row1, b.col0 : b.col1] = 255
     return mask
 

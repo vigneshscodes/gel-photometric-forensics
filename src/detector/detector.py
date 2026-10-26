@@ -57,6 +57,19 @@ from .consistency import (
     estimate_residual_scale,
 )
 
+from .features import (
+    to_grid,
+    pool_signed,
+    robust_z,
+    level_channel,
+    histogram_roughness,
+    hist_residuals,
+    LOG_SCALE_FLOOR,
+    LEVEL_SCALE_FLOOR,
+)
+
+from .consistency import BlockConsistency
+
 from .visualization import (
     build_raw_block_map,
     render_heatmap_png,
@@ -187,6 +200,22 @@ def run_on_image(
         config.epsilon_0,
     )
 
+    # --- v1.2: complementary channels fused into one block score ---
+    # Dispersion alone cannot see additive brightness shifts and is noisy
+    # for mild contrast/gamma edits. Each channel is a local-vs-global
+    # residual against a model fitted on this same image; the fused score
+    # is the max over channels of max(|z_raw|, |z_pooled|). The fused score
+    # replaces |z_k| everywhere downstream (M_image, heatmap, mask, CSV).
+    extra_cols = {}
+    if config.use_extra_channels:
+        block_consistency, extra_cols, channel_diag, loc_consistency = _fuse_channels(
+            blocks, block_stats, block_consistency, image, flat_mask, G,
+            theta_grad, (height, width), config,
+        )
+    else:
+        channel_diag = {"channels": ["dispersion"]}
+        loc_consistency = None
+
     # Goodness-of-fit diagnostic (Section 15):
     # spread of finite residuals {r_k}.
     valid_r = np.array(
@@ -237,7 +266,53 @@ def run_on_image(
         blocks,
         block_consistency,
         config.tau,
+        config.loc_ratio if config.use_extra_channels else 1.0,
+        loc_consistency,
     )
+
+    # Localization fallback:
+    # If the image is flagged but strict seeds produce an empty mask,
+    # recover spatially coherent anomalous blocks using a lower threshold.
+    if flagged and not np.any(suspicious_mask_img):
+        scores = np.array([
+            abs(bc.z_k) if bc.eligible and np.isfinite(bc.z_k) else np.nan
+            for bc in block_consistency
+        ])
+
+        finite_scores = scores[np.isfinite(scores)]
+
+        if finite_scores.size:
+            fallback_tau = max(
+                config.loc_ratio * config.tau,
+                float(np.percentile(finite_scores, 95))
+            )
+
+            fallback_consistency = [
+                BlockConsistency(
+                    block_index=bc.block_index,
+                    eligible=bc.eligible,
+                    mu_k=bc.mu_k,
+                    s_k=bc.s_k,
+                    s_hat_mu_k=bc.s_hat_mu_k,
+                    r_k=bc.r_k,
+                    z_k=(
+                        float(scores[i])
+                        if np.isfinite(scores[i])
+                        else float("nan")
+                    ),
+                )
+                for i, bc in enumerate(block_consistency)
+            ]
+
+            suspicious_mask_img = build_suspicious_region_mask(
+                height,
+                width,
+                blocks,
+                fallback_consistency,
+                fallback_tau,
+                config.loc_ratio,
+                loc_consistency,
+            )
 
     # ---------------- write outputs ----------------
 
@@ -281,6 +356,7 @@ def run_on_image(
         output_dir,
         block_stats,
         block_consistency,
+        extra_cols,
     )
 
     per_bin_counts = {
@@ -349,8 +425,11 @@ def run_on_image(
         "image_level_score_M_image": m_image,
 
         "image_level_score_definition":
-            "Q_beta(|z_k|) over eligible blocks "
-            "(see consistency.py ambiguity #7)",
+            "Q_beta(fused block score) over eligible blocks; fused score = "
+            "max over channels of max(|z_raw|, |z_pooled|) (v1.2). "
+            "With use_extra_channels=False it is Q_beta(|z_k|) of v1.1.",
+
+        "channel_diagnostics": channel_diag,
 
         "beta_percentile_used": config.beta,
         "tau_threshold_used": config.tau,
@@ -368,7 +447,8 @@ def run_on_image(
 
         "scope_limitations": [
             "Does not detect tonal edits confined to band interiors.",
-            "Does not detect pure local brightness offsets with no dispersion change.",
+            "Brightness offsets are credited only when supported by a sharp step edge and a deviation from the global surface; feathered/soft-edged additive edits and offsets larger than the surface-fit tolerance on smooth band structure may be missed.",
+            "Histogram-comb evidence is destroyed by lossy re-compression (JPEG); then only dispersion and level channels remain.",
             "Does not detect matched-noise-evasion manipulation.",
             "Does not detect edits smaller than one block (B x B).",
             "Not validated on composite/multi-acquisition images (out of scope).",
@@ -408,6 +488,102 @@ def run_on_image(
     result.decision_flagged = flagged
 
     return result
+
+
+def _fuse_channels(blocks, block_stats, bcs, image, flat_mask, G, theta_grad, shape, config):
+    n = len(blocks)
+    ps = config.pool_size
+    el = np.array([bc.eligible and np.isfinite(bc.z_k) for bc in bcs])
+
+    def score(r_vec, floor, centre=True):
+        """(signed raw z, fused |z|) for a residual vector over blocks."""
+        z_raw = robust_z(r_vec, floor) if centre else r_vec
+        g = to_grid(r_vec, blocks)
+        zp = robust_z(pool_signed(g, ps).ravel(), floor / max(ps, 1)) if ps > 1 else z_raw
+        both = np.nanmax(np.vstack([np.abs(z_raw), np.abs(zp)]), axis=0) if n else z_raw
+        return z_raw, np.where(np.isfinite(both), both, np.nan), zp
+
+    # channel 1: dispersion (existing residual r_k, already robust-scaled -> z_k)
+    r_disp = np.array([bc.r_k for bc in bcs])
+    z_disp_raw = np.array([bc.z_k for bc in bcs])
+    _, _, zp_disp = score(r_disp, LOG_SCALE_FLOOR)
+    s_disp = np.fmax(np.abs(z_disp_raw), np.abs(zp_disp))
+
+    # channel 2: level (global robust surface, edge-sharpness gated)
+    d, d_gated, lvl_scale = level_channel(
+        blocks, block_stats, G, theta_grad, shape,
+        config.level_poly_degree, config.level_step_ratio, image=image,
+    )
+    zl_raw = np.full(n, np.nan)
+    f = np.isfinite(d_gated)
+    if f.any() and np.isfinite(lvl_scale):
+        zl_raw[f] = d_gated[f] / max(lvl_scale, LEVEL_SCALE_FLOOR)
+    if ps > 1:
+        pl = pool_signed(to_grid(d_gated, blocks), ps).ravel()
+        zl_pool = np.where(np.isfinite(pl), pl / max(lvl_scale, LEVEL_SCALE_FLOOR) if np.isfinite(lvl_scale) else np.nan, np.nan)
+    else:
+        zl_pool = zl_raw
+    s_lvl = np.fmax(np.abs(zl_raw), np.abs(zl_pool))
+
+    # channel 3: histogram roughness (gap / peak fingerprint)
+    if config.use_hist_channel:
+        chi = histogram_roughness(image, flat_mask, blocks, block_stats,
+                                  config.hist_window, config.hist_min_pixels)
+        r_hist = hist_residuals(block_stats, chi, config.n_bins, config.bin_mode)
+    else:
+        chi = np.full(n, np.nan)
+        r_hist = np.full(n, np.nan)
+    zh_raw, _, zh_pool = score(r_hist, LOG_SCALE_FLOOR)
+    s_hist = np.fmax(np.abs(zh_raw), np.abs(zh_pool))
+
+    stack = np.vstack([s_disp, s_lvl, s_hist])
+    fused = np.where(np.all(np.isnan(stack), axis=0), np.nan, np.nanmax(np.where(np.isnan(stack), -np.inf, stack), axis=0))
+    fused = np.where(np.isfinite(fused), fused, np.nan)
+
+    s_raw = np.vstack([np.abs(z_disp_raw), np.abs(zl_raw), np.abs(zh_raw)])
+    raw_fused = np.where(np.all(np.isnan(s_raw), axis=0), np.nan,
+                         np.nanmax(np.where(np.isnan(s_raw), -np.inf, s_raw), axis=0))
+    raw_fused = np.where(np.isfinite(raw_fused), raw_fused, np.nan)
+    loc = []
+    for i, bc in enumerate(bcs):
+        zr = float(raw_fused[i]) if (bc.eligible and np.isfinite(raw_fused[i])) else float("nan")
+        loc.append(BlockConsistency(
+            block_index=bc.block_index, eligible=bc.eligible, mu_k=bc.mu_k, s_k=bc.s_k,
+            s_hat_mu_k=bc.s_hat_mu_k, r_k=bc.r_k, z_k=zr,
+        ))
+
+    out = []
+    for i, bc in enumerate(bcs):
+        z = float(fused[i]) if (bc.eligible and np.isfinite(fused[i])) else float("nan")
+        out.append(BlockConsistency(
+            block_index=bc.block_index, eligible=bc.eligible, mu_k=bc.mu_k, s_k=bc.s_k,
+            s_hat_mu_k=bc.s_hat_mu_k, r_k=bc.r_k, z_k=z,
+        ))
+
+    dom = np.array(["dispersion", "level", "histogram"])
+    which = np.full(n, "", dtype=object)
+    for i in range(n):
+        if np.isfinite(fused[i]):
+            which[i] = dom[int(np.argmax(np.where(np.isnan(stack[:, i]), -np.inf, stack[:, i])))]
+
+    extra = {
+        "score_dispersion": s_disp, "score_level": s_lvl, "score_histogram": s_hist,
+        "level_dev_d_k": d, "hist_roughness_chi": chi, "dominant_channel": which,
+    }
+    diag = {
+        "channels": ["dispersion", "level"] + (["histogram"] if config.use_hist_channel else []),
+        "level_surface_scale": lvl_scale,
+        "level_blocks_scored": int(np.isfinite(d_gated).sum()),
+        "level_blocks_gated_out_as_smooth_structure": int(np.isfinite(d).sum() - np.isfinite(d_gated).sum()),
+        "histogram_blocks_scored": int(np.isfinite(chi).sum()),
+        "pool_size": ps,
+        "block_max_by_channel": {
+            "dispersion": float(np.nanmax(s_disp)) if np.isfinite(s_disp).any() else None,
+            "level": float(np.nanmax(s_lvl)) if np.isfinite(s_lvl).any() else None,
+            "histogram": float(np.nanmax(s_hist)) if np.isfinite(s_hist).any() else None,
+        },
+    }
+    return out, extra, diag, loc
 
 
 def _json_default(o):
@@ -501,7 +677,11 @@ def _write_block_stats_csv(
     output_dir: str,
     block_stats,
     block_consistency,
+    extra_cols=None,
 ) -> None:
+    extra_cols = extra_cols or {}
+    extra_names = list(extra_cols.keys())
+    index_pos = {s.block_index: i for i, s in enumerate(block_stats)}
     path = os.path.join(
         output_dir,
         "block_stats.csv",
@@ -534,7 +714,7 @@ def _write_block_stats_csv(
                 "r_k",
                 "z_k",
                 "abs_z_k",
-            ]
+            ] + extra_names
         )
 
         for s in block_stats:
@@ -585,5 +765,14 @@ def _write_block_stats_csv(
                         if np.isnan(bc.z_k)
                         else abs(bc.z_k)
                     ),
-                ]
+                ] + [_fmt(extra_cols[k][index_pos[s.block_index]]) for k in extra_names]
             )
+
+
+def _fmt(v):
+    if isinstance(v, str):
+        return v
+    try:
+        return "" if np.isnan(v) else float(v)
+    except TypeError:
+        return v
