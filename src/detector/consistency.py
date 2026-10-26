@@ -1,3 +1,4 @@
+
 """
 Consistency metric, image-level score, and decision rule.
 Methodology Sections 6, 9, 10.
@@ -43,17 +44,17 @@ def compute_residuals_and_zscores(
     epsilon_0: float,
 ) -> List[BlockConsistency]:
     """
-    Compute r_k and z_k for every eligible block.
+    Compute residuals and robust normalized scores for eligible blocks.
 
-    Ineligible blocks remain undefined and receive NaN values.
+    If residual MAD is zero:
+      - All finite residuals exactly zero: assign zero z-scores.
+      - Any finite residual is nonzero: scores remain undefined.
+
+    Ineligible blocks remain undefined.
     """
 
-    eligible_stats = [
-        s for s in block_stats
-        if s.eligible
-    ]
+    eligible_stats = [s for s in block_stats if s.eligible]
 
-    # No eligible blocks -> all consistency values are undefined.
     if not eligible_stats:
         return [
             BlockConsistency(
@@ -69,65 +70,53 @@ def compute_residuals_and_zscores(
         ]
 
     mu_arr = np.array(
-        [s.mu_k for s in eligible_stats],
-        dtype=np.float64,
+        [s.mu_k for s in eligible_stats], dtype=np.float64
     )
-
     s_arr = np.array(
-        [s.s_k for s in eligible_stats],
-        dtype=np.float64,
+        [s.s_k for s in eligible_stats], dtype=np.float64
     )
 
-    # Evaluate the global dispersion-vs-level model.
+    # Global dispersion-versus-intensity model.
     s_hat_arr = curve.evaluate(mu_arr)
 
-    # r_k = log(s_k + eps) - log(s_hat(mu_k) + eps)
     with np.errstate(divide="ignore", invalid="ignore"):
         r_arr = (
             np.log(s_arr + epsilon_0)
             - np.log(s_hat_arr + epsilon_0)
         )
 
-    # Keep only finite residuals for robust scale estimation.
-    valid_r = r_arr[np.isfinite(r_arr)]
+    valid_mask = np.isfinite(r_arr)
+    valid_r = r_arr[valid_mask]
 
-    if valid_r.size > 0:
-        residual_mad = median_absolute_deviation(valid_r)
-    else:
-        residual_mad = float("nan")
+    residual_mad = (
+        median_absolute_deviation(valid_r)
+        if valid_r.size > 0
+        else float("nan")
+    )
 
-    # Robust scale of residual population.
+    z_arr = np.full_like(r_arr, np.nan, dtype=np.float64)
+
     if np.isfinite(residual_mad) and residual_mad > 0:
         denom = MAD_TO_SIGMA_CONSTANT * residual_mad
-    else:
-        denom = float("nan")
+        z_arr[valid_mask] = r_arr[valid_mask] / denom
 
-    # A zero/undefined MAD means z-score normalization is mathematically
-    # undefined. Do NOT replace it with zero.
-    if np.isfinite(denom) and denom > 0:
-        z_arr = r_arr / denom
-    else:
-        z_arr = np.full_like(
-            r_arr,
-            np.nan,
-            dtype=np.float64,
-        )
+    elif (
+        valid_r.size > 0
+        and np.all(valid_r == 0.0)
+    ):
+        # Exact zero residuals mean every finite residual matches
+        # the fitted global model. No arbitrary scale is introduced.
+        z_arr[valid_mask] = 0.0
+
+    # Otherwise leave scores undefined: zero MAD with nonzero residuals
+    # does not provide a defensible MAD-normalized score.
 
     results: List[BlockConsistency] = []
-
-    # Iterator over eligible-block calculations.
-    it = iter(
-        zip(
-            mu_arr,
-            s_arr,
-            s_hat_arr,
-            r_arr,
-            z_arr,
-        )
+    eligible_iter = iter(
+        zip(mu_arr, s_arr, s_hat_arr, r_arr, z_arr)
     )
 
     for s in block_stats:
-
         if not s.eligible:
             results.append(
                 BlockConsistency(
@@ -142,13 +131,7 @@ def compute_residuals_and_zscores(
             )
             continue
 
-        (
-            mu_k,
-            s_k,
-            s_hat_mu_k,
-            r_k,
-            z_k,
-        ) = next(it)
+        mu_k, s_k, s_hat_mu_k, r_k, z_k = next(eligible_iter)
 
         results.append(
             BlockConsistency(
@@ -170,14 +153,9 @@ def compute_image_level_score(
     beta: float,
 ) -> float:
     """
-    Compute the image-level inconsistency score.
+    Compute M_image = Q_beta(|z_k|) over finite eligible scores.
 
-        M_image = Q_beta({ |z_k| : k eligible })
-
-    Only finite eligible z-scores are included.
-
-    If no finite eligible z-scores exist, M_image is undefined
-    and NaN is returned.
+    Returns NaN when no finite eligible scores exist.
     """
 
     eligible_abs_z = np.array(
@@ -192,24 +170,14 @@ def compute_image_level_score(
     if eligible_abs_z.size == 0:
         return float("nan")
 
-    return float(
-        np.percentile(
-            eligible_abs_z,
-            beta,
-        )
-    )
+    return float(np.percentile(eligible_abs_z, beta))
 
 
-def decide(
-    m_image: float,
-    tau: float,
-) -> bool:
+def decide(m_image: float, tau: float) -> bool:
     """
-    Flag image as inconsistent iff:
+    Flag an image iff M_image >= tau.
 
-        M_image >= tau
-
-    An undefined M_image (NaN) is NOT silently treated as clean.
+    An undefined score is not classified as clean.
     """
 
     if not np.isfinite(m_image):
