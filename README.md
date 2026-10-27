@@ -1,71 +1,125 @@
-# Gel Photometric Forensics — LGPC-BC detector
+# Local-Global Photometric Consistency Framework
 
-CPU-only, classical (no deep learning) detector for **localized tonal edits** in gel / western-blot
-images: it fits a global dispersion-vs-intensity curve and flags blocks whose local noise level is
-inconsistent with it, while tolerating legitimate *global* brightness/contrast/gamma/tone-curve changes.
+A Python-based computer vision prototype for detecting and localizing suspicious tonal edits in scientific gel electrophoresis and Western blot images.
 
-## Install and run
+## Features
 
-```bash
-python -m venv .venv && source .venv/bin/activate      # Windows: .venv\Scripts\activate
-pip install -r requirements.txt
+- **Image preprocessing:** Prepares input images and estimates background characteristics.
+- **Local feature extraction:** Analyses image blocks to capture tonal variations.
+- **Photometric consistency analysis:** Compares local image characteristics against a global photometric model.
+- **Anomaly detection:** Generates an image-level anomaly score and detection decision.
+- **Region localization:** Produces anomaly heatmaps and suspicious-region masks.
+- **Visualization:** Provides a graphical interface for examining detection results.
 
-# single image or folder (8-bit single-channel input)
-python run_detector.py --input path/to/image.png --output out/
-# outputs: image_level_score.json, diagnostics.json, normalized_heatmap.png,
-#          suspicious_region_mask.png, eligibility_mask.png, raw_block_consistency_map.npy, ...
+## Tech Stack
 
-# reproduce the seeded synthetic benchmark (calibration -> held-out test), ~1 min on CPU
-python reproduce_benchmark.py --work-dir benchmark_runs/repro
+Python, OpenCV, NumPy, SciPy, scikit-image, Pillow, Matplotlib, Tkinter, Git.
+
+## Project Structure
+
+```text
+gel-photometric-forensics/
+├── src/
+│   ├── detector/
+│   │   ├── features.py
+│   │   ├── consistency.py
+│   │   ├── detector.py
+│   │   ├── config.py
+│   │   └── visualization.py
+│   └── evaluation/
+│       ├── generate_benchmark.py
+│       └── run_benchmark.py
+├── run_detector.py
+├── gui_detector.py
+├── working_cases_viewer.py
+└── README.md
 ```
 
-## What was fixed (verified causes)
+*This is an overview of the main files. The repository may contain additional files.*
 
-Baseline: F1 = 0, mean localization IoU ≈ 0.0063, 5 NaN scores.
+## Installation
 
-| Problem | Verified cause | Fix |
-|---|---|---|
-| Nothing ever flagged | `beta=95` took the 95th percentile of \|z\| over ~170 blocks; a small edit touches ≤4 blocks, so M_image could not reach `tau`. `tau=3.5` was also never calibrated. | `beta=100` (max); `tau` calibrated on **negatives only**, on seeds disjoint from the test set (`calibrate_tau.py`). |
-| Edited regions scored as "undefined" | Local contrast/gamma amplifies noise → raw Sobel gradient exceeds the global flat threshold → edited blocks were ineligible (0–3% of in-edit pixels had a score). | Flat-region gate uses a lightly Gaussian-smoothed gradient (`grad_smooth_sigma=0.7`, `grad_percentile=60`). |
-| 5 NaN scores | Residual MAD = 0 (block MADs of 8-bit data are quantized, many blocks identical) → all z left undefined. | Scale ladder MAD → IQR → std with a floor (`estimate_residual_scale`); the source is logged in `diagnostics.json`. |
-| False alarms on legitimate global tone curves | Raw MAD of integer data is heavily quantized (1.0 vs 2.4 after a compressive LUT); fixed [0,255] bins left only ~2 populated bins. | Trimmed-std dispersion estimator; quantile (data-adaptive) bins, `n_bins=12`. |
-| Benchmark ~14 s/image | 129×129 `scipy` median filter. | Exact equivalent via reflect-pad + `cv2.medianBlur` (max abs diff 0.0 vs scipy). |
+Requires Python 3.10 or later and pip.
 
-Legacy behaviour is still selectable (`dispersion_estimator="mad"`, `bin_mode="range"`, `grad_smooth_sigma=0`).
-Research-handoff items used selectively: monotone-region opt-out (already the flat/eligibility gate),
-MCC/AUC reporting, zero-dispersion guard. Not used (out of scope/not applicable here): Cao-style gap
-fingerprints (fragile under JPEG, different problem), consensus gap templates, FBIGEL baseline (not implemented).
+Clone the repository:
 
-## Actual results (synthetic, seeded; `docs/results/`)
+```bash
+git clone https://github.com/vigneshscodes/gel-photometric-forensics.git
+cd gel-photometric-forensics
+```
 
-Calibration: seeds 5000–5007 (168 cases), τ = 7.549 chosen for ≤10% FPR on 72 negatives.
-Held-out test: seeds 1000–1001 (42 cases: 18 negatives, 24 local-edit positives), τ = 7.55.
+Create and activate a virtual environment:
 
-| Metric (test) | Baseline | Now |
-|---|---|---|
-| TP / FP / TN / FN | 0 / 3 / 15 / 24 | 8 / 1 / 17 / 16 |
-| Precision / Recall | 0 / 0 | 0.889 / 0.333 |
-| **F1** | 0.000 | **0.485** |
-| MCC | – | 0.335 |
-| AUC-ROC | – | 0.661 |
-| False-positive rate | 0.167 | 0.056 |
-| Mean localization IoU | 0.0063 | **0.087** (median 0.0) |
-| NaN scores | 5 | 0 |
+**Windows**
+```bash
+python -m venv .venv
+.venv\Scripts\activate
+```
 
-Detection by family (test): local_gamma 5/6, local_brightness 3/6, local_contrast 0/6,
-local_nonlinear_tone 0/6; false alarms: 1/4 `global_monotonic_tone`, none on clean/brightness/contrast/gamma.
-Excluding band-interior edits (documented undetectable): F1 = 0.583, recall 0.438.
+**Linux/macOS**
+```bash
+python -m venv .venv
+source .venv/bin/activate
+```
 
-## Limitations (please read)
+Install the dependencies:
 
-- **Performance is modest.** Test set is tiny (24 positives), so these numbers have wide uncertainty; AUC 0.66 means weak image-level separation. Localization IoU is low (block-level maps, edits only 24×24 or 8×8 px, most edit blocks still ineligible).
-- Only **synthetic** images (own noise model, hard-edged rectangles). No BioFors/real-image evaluation was run; the dataset is not in the ZIP. τ is calibrated on synthetic data and must be re-calibrated for real images.
-- Not detected by design: edits confined to band interiors, pure brightness offsets without dispersion change, edits smaller than a block, matched-noise edits. That `local_brightness` is flagged 3/6 is **not** an intended mechanism; its cause was not investigated (possibly edge/eligibility side effects).
-- Local contrast and local nonlinear-tone edits were not detected at the held-out τ.
-- Max-aggregation (`beta=100`) is sensitive to single-block outliers; one legitimate steep global LUT still false-alarms.
-- No FBIGEL baseline comparison was implemented. Screening aid only — not proof of misconduct.
+```bash
+pip install numpy opencv-python scipy scikit-image pillow matplotlib
+```
 
-## Layout
+Install any additional dependencies required by the selected entry point or listed in the project configuration.
 
-`src/detector/` (pipeline) · `src/evaluation/` (generator, benchmark, `calibrate_tau.py`, `evaluate_metrics.py`) ·
-`src/preprocessing/` (BioFors dataset tooling, unchanged) · `reproduce_benchmark.py` · `docs/results/`
+## Usage
+
+Run the detector:
+
+```bash
+python run_detector.py
+```
+
+Launch the graphical interface:
+
+```bash
+python gui_detector.py
+```
+
+Open the benchmark results viewer:
+
+```bash
+python working_cases_viewer.py
+```
+
+Follow the on-screen prompts to select the input image or previously generated benchmark results and their corresponding directory.
+
+## Methodology
+
+The framework follows these main stages:
+
+1. Image preprocessing and background estimation.
+2. Local block-based feature extraction.
+3. Global photometric modelling.
+4. Local-global consistency analysis.
+5. Image-level anomaly scoring.
+6. Suspicious-region localization and visualization.
+
+## Limitations
+
+- Detection performance may vary across tonal-edit types.
+- Suspicious-region masks may be inaccurate or empty.
+- Evaluation on synthetic images does not establish performance on real biomedical images.
+- A flagged image indicates a potential anomaly and does not establish research misconduct.
+
+## Intended Use
+
+This project is an academic research prototype designed to support the screening of scientific images for potential tonal manipulation. Its outputs should be interpreted alongside expert review.
+
+## Author
+
+**Vignesh S.**  
+B.Tech. Computer Science and Engineering  
+Vellore Institute of Technology, Vellore, India
+
+## License
+
+No license has been specified. Contact the author before redistributing or reusing the code.
